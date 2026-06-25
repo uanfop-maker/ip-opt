@@ -397,7 +397,7 @@ async def cmd_traceroute(update, context):
 @require_admin
 async def cmd_restart(update, context):
     msg = await update.message.reply_text("⏳ 重啟 Xray...")
-    result = ssh_run('kill -HUP $(pgrep xray) 2>/dev/null && echo "OK" || (kill $(pgrep xray) 2>/dev/null; sleep 1; /usr/bin/xray run -c /etc/xray/config.json &; echo "restarted")')
+    result = ssh_run("sh -c 'killall -HUP xray && echo OK || (killall xray; sleep 1; echo restarted)')")
     await msg.edit_text(f"✅ Xray 已重啟\n{result[:200]}")
 
 @require_admin
