@@ -579,40 +579,6 @@ async def cmd_restart(update, context):
     await msg.edit_text(f"[Machine {label}] ✅ Xray 已重啟\n{result[:200]}")
 
 @require_admin
-async def cmd_iprotation(update, context):
-    args = context.args
-    target = 'c'
-    if args and args[0].lower() in ('b', 'c'):
-        target = args[0].lower()
-        args = args[1:]
-
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
-
-    if not args:
-        settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
-        settings = json.loads(settings_raw.strip() or '{}')
-        rotation = settings.get('rotation', 'on')
-        threshold = settings.get('threshold', 90)
-        await update.message.reply_text(f"[Machine {label}] 自動換 IP：{rotation}\n門檻：{threshold}%")
-        return
-
-    param = args[0].lower()
-    if param in ('on', 'off'):
-        machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='{param}'; json.dump(d, open('/data/settings.json','w'))\"")
-        await update.message.reply_text(f"[Machine {label}] ✅ 自動換 IP 已{'開啟' if param=='on' else '關閉'}")
-    elif param.isdigit():
-        val = int(param)
-        if 1 <= val <= 99:
-            machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['threshold']={val}; json.dump(d, open('/data/settings.json','w'))\"")
-            await update.message.reply_text(f"[Machine {label}] ✅ 門檻設為 {val}%")
-        else:
-            await update.message.reply_text("❌ 請輸入 1-99 之間的數字")
-    else:
-        await update.message.reply_text("用法：/iprotation [b|c] on|off|數字")
-
-@require_admin
 async def cmd_adminlist(update, context):
     args = context.args
     if len(args) < 2:
