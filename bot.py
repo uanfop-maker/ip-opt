@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ip-opt: Fly.io Xray VPN management Telegram bot"""
+"""ip-opt: Fly.io Xray VPN management Telegram bot (multi-machine)"""
 import os, json, uuid, base64, subprocess, requests, tempfile, qrcode
 from io import BytesIO
 from telegram import Update, BotCommand
@@ -8,17 +8,36 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # Config
 BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 FLY_API_TOKEN = os.environ['FLY_API_TOKEN']
-FLY_APP = os.environ.get('FLY_APP', 'ganamia-xray-cn')
-ADMIN_FILE = '/app/data/admins.json'  # local storage for admins
+
+# Machine C (original Xray CN, ganamia-xray-cn)
+MACHINE_C_APP = os.environ.get('FLY_APP', 'ganamia-xray-cn')
+MACHINE_C_ID = os.environ.get('MACHINE_C_ID', '080d12db59e978')
+
+# Machine B (Xray WG-VPN app, ganamia-wg-vpn)
+MACHINE_B_APP = os.environ.get('MACHINE_B_APP', 'ganamia-wg-vpn')
+MACHINE_B_ID = os.environ.get('MACHINE_B_ID', '48ee095bd021d8')
+
+# Machine A (WireGuard, ganamia-wg-vpn)
+MACHINE_A_APP = os.environ.get('MACHINE_A_APP', 'ganamia-wg-vpn')
+MACHINE_A_ID = os.environ.get('MACHINE_A_ID', '2870275c134958')
+
+ADMIN_FILE = '/app/data/admins.json'
 SETTINGS_LOCAL = '/app/data/settings.json'
 
-# VLESS connection info
-XRAY_SNI = 'www.apple.com'
-XRAY_FP = 'chrome'
-XRAY_FLOW = 'xtls-rprx-vision'
-XRAY_PORT = 443
+# VLESS connection info for Machine C
+XRAY_C_SNI = 'www.apple.com'
+XRAY_C_FP = 'chrome'
+XRAY_C_FLOW = 'xtls-rprx-vision'
+XRAY_C_PORT = 443
 
-# Default admin
+# VLESS connection info for Machine B
+XRAY_B_SNI = 'addons.mozilla.org'
+XRAY_B_FP = 'chrome'
+XRAY_B_FLOW = 'xtls-rprx-vision'
+XRAY_B_PORT = 443
+XRAY_B_PUBKEY = 'MPO9W-mBflxhkz8HFKZR65rSVKwIPUhMCzTKIwm5ug'   # derived from MP4jWvcOrKCp1wB2y0TuhBSq52C4Gu_FmwTzmFCjCWM
+XRAY_B_SHORTID = '43fad4af'
+
 DEFAULT_ADMINS = [8272893083]
 
 os.makedirs('/app/data', exist_ok=True)
@@ -60,8 +79,9 @@ def fly_machines_api(method, path, data=None):
         json=data, timeout=30)
     return resp.json() if resp.content else {}
 
-def get_current_ip():
-    result = fly_api('{ app(name: "' + FLY_APP + '") { ipAddresses { nodes { address type } } } }')
+def get_current_ip(app=None):
+    target_app = app or MACHINE_C_APP
+    result = fly_api('{ app(name: "' + target_app + '") { ipAddresses { nodes { address type } } } }')
     try:
         ips = result['data']['app']['ipAddresses']['nodes']
         for ip in ips:
@@ -71,15 +91,32 @@ def get_current_ip():
         pass
     return None
 
-def ssh_run(cmd):
-    """Run command on Fly.io machine via SSH"""
+def ssh_run(cmd, app=None, machine_id=None):
+    """Run command on a specific Fly.io machine via SSH"""
     fly_path = '/root/.fly/bin/flyctl'
+    target_app = app or MACHINE_C_APP
+    args = [fly_path, 'ssh', 'console', '--app', target_app, '-C', cmd]
+    if machine_id:
+        args = [fly_path, 'ssh', 'console', '--app', target_app, '--machine', machine_id, '-C', cmd]
     result = subprocess.run(
-        [fly_path, 'ssh', 'console', '--app', FLY_APP, '-C', cmd],
+        args,
         capture_output=True, text=True, timeout=30,
         env={**os.environ, 'FLY_API_TOKEN': FLY_API_TOKEN}
     )
     return result.stdout + result.stderr
+
+def machine_exec(app, machine_id, cmd):
+    """Run command via Machines API exec endpoint (faster than SSH)"""
+    resp = requests.post(
+        f'https://api.machines.dev/v1/apps/{app}/machines/{machine_id}/exec',
+        headers={'Authorization': f'Bearer {FLY_API_TOKEN}'},
+        json={'cmd': cmd, 'timeout': 15},
+        timeout=20
+    )
+    if resp.ok:
+        d = resp.json()
+        return d.get('stdout', '') + d.get('stderr', '')
+    return f'exec error: {resp.status_code}'
 
 def generate_qr(vless_uri):
     qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=8, border=4)
@@ -91,13 +128,22 @@ def generate_qr(vless_uri):
     buf.seek(0)
     return buf
 
-def make_vless_uri(ip, client_uuid, name="VPN"):
+def make_vless_uri_c(ip, client_uuid, name="VPN-C"):
     from urllib.parse import quote
     pubkey = os.environ.get('XRAY_PUBKEY', 'jAxEkKnMiqU_7y-Qev9rvgjiKd8t7usngjAbSbQgAnw')
     shortid = os.environ.get('XRAY_SHORTID', '7dd35619b1caf795')
-    return (f"vless://{client_uuid}@{ip}:{XRAY_PORT}"
-            f"?encryption=none&flow={XRAY_FLOW}&security=reality"
-            f"&sni={XRAY_SNI}&fp={XRAY_FP}&pbk={pubkey}&sid={shortid}"
+    return (f"vless://{client_uuid}@{ip}:{XRAY_C_PORT}"
+            f"?encryption=none&flow={XRAY_C_FLOW}&security=reality"
+            f"&sni={XRAY_C_SNI}&fp={XRAY_C_FP}&pbk={pubkey}&sid={shortid}"
+            f"&type=tcp&headerType=none#{quote(name)}")
+
+def make_vless_uri_b(ip, client_uuid, name="VPN-B"):
+    from urllib.parse import quote
+    pubkey = os.environ.get('XRAY_B_PUBKEY', XRAY_B_PUBKEY)
+    shortid = XRAY_B_SHORTID
+    return (f"vless://{client_uuid}@{ip}:{XRAY_B_PORT}"
+            f"?encryption=none&flow={XRAY_B_FLOW}&security=reality"
+            f"&sni={XRAY_B_SNI}&fp={XRAY_B_FP}&pbk={pubkey}&sid={shortid}"
             f"&type=tcp&headerType=none#{quote(name)}")
 
 # Commands
@@ -105,180 +151,262 @@ def make_vless_uri(ip, client_uuid, name="VPN"):
 @require_admin
 async def cmd_start(update, context):
     await update.message.reply_text(
-        "🔐 ip-opt VPN 管理機器人\n\n"
+        "🔐 ip-opt VPN 管理機器人（3 機器版）\n\n"
+        "A: WireGuard (ganamia-wg-vpn)\n"
+        "B: Xray VLESS (ganamia-wg-vpn, addons.mozilla.org)\n"
+        "C: Xray VLESS (ganamia-xray-cn, www.apple.com)\n\n"
         "輸入 / 查看所有指令"
     )
 
 @require_admin
 async def cmd_ipnow(update, context):
-    ip = get_current_ip()
-    await update.message.reply_text(f"🌐 目前 IP：{ip or '無法取得'}")
+    ip_b = get_current_ip(MACHINE_B_APP)
+    ip_c = get_current_ip(MACHINE_C_APP)
+    await update.message.reply_text(
+        f"🌐 目前 IP\n"
+        f"Machine B (Xray WG): {ip_b or '無法取得'}\n"
+        f"Machine C (Xray CN): {ip_c or '無法取得'}"
+    )
 
 @require_admin
 async def cmd_ipswitching(update, context):
     args = context.args
-    country = args[0].upper() if args else 'JP'
+    # Support /ipswitching [b|c] [country]
+    target = 'c'
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
 
-    msg = await update.message.reply_text("🔄 正在換 IP...")
+    if target == 'b':
+        app = MACHINE_B_APP
+        machine_id = MACHINE_B_ID
+        label = 'B'
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
 
-    old_ip = get_current_ip()
+    msg = await update.message.reply_text(f"🔄 Machine {label} 換 IP...")
+    old_ip = get_current_ip(app)
 
-    # Allocate new IPv4
     result = fly_api('''
     mutation($input: AllocateIPAddressInput!) {
         allocateIpAddress(input: $input) { ipAddress { address } }
-    }''', {'input': {'appId': FLY_APP, 'type': 'v4', 'region': ''}})
+    }''', {'input': {'appId': app, 'type': 'v4', 'region': ''}})
 
     new_ip = None
     try:
         new_ip = result['data']['allocateIpAddress']['ipAddress']['address']
     except:
-        await msg.edit_text(f"❌ 換 IP 失敗：{result}")
+        await msg.edit_text(f"❌ Machine {label} 換 IP 失敗：{result}")
         return
 
-    # Release old IP
     if old_ip and old_ip != new_ip:
         fly_api('''
         mutation($input: ReleaseIPAddressInput!) {
             releaseIpAddress(input: $input) { app { name } }
-        }''', {'input': {'appId': FLY_APP, 'ip': old_ip}})
+        }''', {'input': {'appId': app, 'ip': old_ip}})
 
-    # Generate new QR code
-    clients_json = ssh_run('cat /data/clients.json 2>/dev/null || echo "{}"')
+    clients_json = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
     try:
         clients = json.loads(clients_json.strip())
     except:
         clients = {}
 
-    text = f"✅ IP 已切換\n舊 IP：{old_ip}\n新 IP：{new_ip}\n\n掃碼更新設定："
+    text = f"✅ Machine {label} IP 已切換\n舊 IP：{old_ip}\n新 IP：{new_ip}\n\n掃碼更新設定："
     await msg.edit_text(text)
 
-    # Send QR codes for all active clients
     for name, info in clients.items():
         if info.get('active', True):
-            uri = make_vless_uri(new_ip, info['uuid'], name)
+            if target == 'b':
+                uri = make_vless_uri_b(new_ip, info['uuid'], name)
+            else:
+                uri = make_vless_uri_c(new_ip, info['uuid'], name)
             qr_buf = generate_qr(uri)
-            await update.message.reply_photo(qr_buf, caption=f"用戶：{name}")
+            await update.message.reply_photo(qr_buf, caption=f"[{label}] 用戶：{name}")
 
 @require_admin
 async def cmd_iprotation(update, context):
     args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
+
     if not args:
-        settings = json.loads(ssh_run('cat /data/settings.json 2>/dev/null || echo "{}"').strip() or '{}')
+        settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
+        settings = json.loads(settings_raw.strip() or '{}')
         rotation = settings.get('rotation', 'on')
         threshold = settings.get('threshold', 90)
-        await update.message.reply_text(f"自動換 IP：{rotation}\n門檻：{threshold}%")
+        await update.message.reply_text(f"[Machine {label}] 自動換 IP：{rotation}\n門檻：{threshold}%")
         return
 
     param = args[0].lower()
     if param in ('on', 'off'):
-        ssh_run(f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='{param}'; json.dump(d, open('/data/settings.json','w'))\"")
-        await update.message.reply_text(f"✅ 自動換 IP 已{'開啟' if param=='on' else '關閉'}")
+        machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='{param}'; json.dump(d, open('/data/settings.json','w'))\"")
+        await update.message.reply_text(f"[Machine {label}] ✅ 自動換 IP 已{'開啟' if param=='on' else '關閉'}")
     elif param.isdigit():
         val = int(param)
         if 1 <= val <= 99:
-            ssh_run(f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['threshold']={val}; json.dump(d, open('/data/settings.json','w'))\"")
-            await update.message.reply_text(f"✅ 門檻設為 {val}%")
+            machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['threshold']={val}; json.dump(d, open('/data/settings.json','w'))\"")
+            await update.message.reply_text(f"[Machine {label}] ✅ 門檻設為 {val}%")
         else:
             await update.message.reply_text("❌ 請輸入 1-99 之間的數字")
     else:
-        await update.message.reply_text("用法：/iprotation on|off|數字")
+        await update.message.reply_text("用法：/iprotation [b|c] on|off|數字")
 
 @require_admin
 async def cmd_setlimit(update, context):
     args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
     if not args or not args[0].isdigit():
-        await update.message.reply_text("用法：/setlimit 100 (GB)")
+        await update.message.reply_text("用法：/setlimit [b|c] 100 (GB)")
         return
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
     gb = int(args[0])
-    ssh_run(f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['limit_gb']={gb}; json.dump(d, open('/data/settings.json','w'))\"")
-    await update.message.reply_text(f"✅ 月流量上限設為 {gb} GB")
+    machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['limit_gb']={gb}; json.dump(d, open('/data/settings.json','w'))\"")
+    await update.message.reply_text(f"[Machine {label}] ✅ 月流量上限設為 {gb} GB")
 
 @require_admin
 async def cmd_usage(update, context):
-    result = ssh_run('cat /data/traffic.json 2>/dev/null || echo "{}"')
-    try:
-        data = json.loads(result.strip())
-    except:
-        data = {}
-
-    settings_raw = ssh_run('cat /data/settings.json 2>/dev/null || echo "{}"')
-    try:
-        settings = json.loads(settings_raw.strip())
-    except:
-        settings = {}
-
     import datetime
     month = datetime.datetime.utcnow().strftime('%Y-%m')
-    monthly = data.get('monthly', {})
+    lines = ["📊 流量統計\n"]
 
-    lines = ["📊 本月流量統計\n"]
-    total = 0
-    for m, b in sorted(monthly.items(), reverse=True)[:3]:
-        gb = b / 1024**3
-        cost = gb * 0.04
-        lines.append(f"{m}：{gb:.2f} GB (${cost:.2f})")
-        if m == month:
-            total = b
+    for label, app, machine_id in [('B', MACHINE_B_APP, MACHINE_B_ID), ('C', MACHINE_C_APP, MACHINE_C_ID)]:
+        data_raw = machine_exec(app, machine_id, 'cat /data/traffic.json 2>/dev/null || echo "{}"')
+        settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
+        try:
+            data = json.loads(data_raw.strip())
+        except:
+            data = {}
+        try:
+            settings = json.loads(settings_raw.strip())
+        except:
+            settings = {}
 
-    limit_gb = settings.get('limit_gb', 100)
-    limit_b = limit_gb * 1024**3
-    pct = total / limit_b * 100 if limit_b > 0 else 0
-    current_cost = total / 1024**3 * 0.04 + 2  # +$2 for IP
+        monthly = data.get('monthly', {})
+        total = monthly.get(month, 0)
+        limit_gb = settings.get('limit_gb', 100)
+        limit_b = limit_gb * 1024**3
+        pct = total / limit_b * 100 if limit_b > 0 else 0
+        cost = total / 1024**3 * 0.04
 
-    lines.append(f"\n本月：{total/1024**3:.2f} GB / {limit_gb} GB ({pct:.1f}%)")
-    lines.append(f"IP 費：$2.00")
-    lines.append(f"流量費：${total/1024**3*0.04:.2f}")
-    lines.append(f"合計：${current_cost:.2f}")
+        lines.append(f"[Machine {label}]")
+        lines.append(f"  本月：{total/1024**3:.2f} GB / {limit_gb} GB ({pct:.1f}%)")
+        lines.append(f"  流量費：${cost:.2f}")
+        lines.append("")
 
     await update.message.reply_text('\n'.join(lines))
 
 @require_admin
 async def cmd_status(update, context):
-    ip = get_current_ip()
-    # Check if xray is running
-    ps_out = ssh_run('ps | grep xray | grep -v grep')
-    xray_running = 'xray' in ps_out
-    uptime = ssh_run('uptime').strip()
+    lines = ["🖥 系統狀態\n"]
 
-    status = "✅ 運行中" if xray_running else "❌ 已停止"
-    await update.message.reply_text(
-        f"🖥 系統狀態\n\n"
-        f"Xray：{status}\n"
-        f"IP：{ip or '無'}\n"
-        f"Uptime：{uptime}"
-    )
+    # Machine A - WireGuard via SSH
+    try:
+        wg_out = ssh_run('wg show 2>/dev/null || echo "WireGuard N/A"', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
+        # Count peers
+        peer_count = wg_out.count('peer:')
+        # Get latest handshake lines
+        handshake_lines = [l.strip() for l in wg_out.splitlines() if 'latest handshake' in l.lower()]
+        lines.append(f"[Machine A] WireGuard")
+        if 'N/A' in wg_out or not wg_out.strip():
+            lines.append("  狀態：無法取得")
+        else:
+            lines.append(f"  Peers：{peer_count}")
+            for h in handshake_lines[:3]:
+                lines.append(f"  {h}")
+    except Exception as e:
+        lines.append(f"[Machine A] WireGuard: 錯誤 {e}")
+    lines.append("")
+
+    # Machine B - Xray
+    ip_b = get_current_ip(MACHINE_B_APP)
+    ps_b = machine_exec(MACHINE_B_APP, MACHINE_B_ID, 'ps | grep xray | grep -v grep || echo ""')
+    xray_b = 'xray' in ps_b
+    uptime_b = machine_exec(MACHINE_B_APP, MACHINE_B_ID, 'uptime').strip()
+    lines.append(f"[Machine B] Xray (addons.mozilla.org)")
+    lines.append(f"  Xray：{'✅ 運行中' if xray_b else '❌ 已停止'}")
+    lines.append(f"  IP：{ip_b or '無'}")
+    lines.append(f"  {uptime_b}")
+    lines.append("")
+
+    # Machine C - Xray
+    ip_c = get_current_ip(MACHINE_C_APP)
+    ps_c = machine_exec(MACHINE_C_APP, MACHINE_C_ID, 'ps | grep xray | grep -v grep || echo ""')
+    xray_c = 'xray' in ps_c
+    uptime_c = machine_exec(MACHINE_C_APP, MACHINE_C_ID, 'uptime').strip()
+    lines.append(f"[Machine C] Xray (www.apple.com)")
+    lines.append(f"  Xray：{'✅ 運行中' if xray_c else '❌ 已停止'}")
+    lines.append(f"  IP：{ip_c or '無'}")
+    lines.append(f"  {uptime_c}")
+
+    await update.message.reply_text('\n'.join(lines))
 
 @require_admin
 async def cmd_whoisusing(update, context):
-    # Read recent Xray access log
-    log_out = ssh_run('tail -20 /var/log/xray/access.log 2>/dev/null || echo "暫無記錄"')
-    if not log_out.strip() or log_out.strip() == '暫無記錄':
-        await update.message.reply_text("暫無連線記錄")
-        return
+    args = context.args
+    target = 'both'
+    if args and args[0].lower() in ('a', 'b', 'c'):
+        target = args[0].lower()
 
-    # Parse connections
-    connections = []
-    for line in log_out.split('\n'):
-        if 'accepted' in line.lower() or '>>>' in line:
-            connections.append(line[:100])
+    lines = []
 
-    if connections:
-        await update.message.reply_text("🔌 最近連線：\n" + '\n'.join(connections[-10:]))
-    else:
-        await update.message.reply_text("目前無活躍連線")
+    if target in ('b', 'both'):
+        log_b = machine_exec(MACHINE_B_APP, MACHINE_B_ID, 'tail -10 /var/log/xray/access.log 2>/dev/null || echo "暫無記錄"')
+        lines.append("[Machine B] 最近連線：")
+        connections = [l for l in log_b.split('\n') if 'accepted' in l.lower() or '>>>' in l]
+        lines.append('\n'.join(connections[-5:]) if connections else "  無記錄")
+        lines.append("")
+
+    if target in ('c', 'both'):
+        log_c = machine_exec(MACHINE_C_APP, MACHINE_C_ID, 'tail -10 /var/log/xray/access.log 2>/dev/null || echo "暫無記錄"')
+        lines.append("[Machine C] 最近連線：")
+        connections = [l for l in log_c.split('\n') if 'accepted' in l.lower() or '>>>' in l]
+        lines.append('\n'.join(connections[-5:]) if connections else "  無記錄")
+
+    if target == 'a':
+        wg = ssh_run('wg show', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
+        lines.append("[Machine A] WireGuard peers：")
+        lines.append(wg[:500] if wg.strip() else "  無記錄")
+
+    await update.message.reply_text('\n'.join(lines) or "暫無連線記錄")
 
 @require_admin
 async def cmd_vpnallowlist(update, context):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("用法：/vpnallowlist add 名稱 | /vpnallowlist remove 名稱")
+        await update.message.reply_text("用法：/vpnallowlist [b|c] add 名稱 | /vpnallowlist [b|c] remove 名稱")
         return
 
+    target = 'c'
+    if args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
+    if len(args) < 2:
+        await update.message.reply_text("用法：/vpnallowlist [b|c] add 名稱 | /vpnallowlist [b|c] remove 名稱")
+        return
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
     action = args[0].lower()
     name = args[1]
 
-    clients_raw = ssh_run('cat /data/clients.json 2>/dev/null || echo "{}"')
+    clients_raw = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
     try:
         clients = json.loads(clients_raw.strip())
     except:
@@ -286,119 +414,203 @@ async def cmd_vpnallowlist(update, context):
 
     if action == 'add':
         if name in clients:
-            await update.message.reply_text(f"❌ 用戶 {name} 已存在")
+            await update.message.reply_text(f"[Machine {label}] ❌ 用戶 {name} 已存在")
             return
 
         new_uuid = str(uuid.uuid4())
         clients[name] = {'uuid': new_uuid, 'active': True, 'email': name}
 
-        # Update clients.json on machine
         clients_b64 = base64.b64encode(json.dumps(clients).encode()).decode()
-        ssh_run(f"echo '{clients_b64}' | base64 -d > /data/clients.json")
+        machine_exec(app, machine_id, f"echo '{clients_b64}' | base64 -d > /data/clients.json")
 
-        # Update Xray config
-        await update.message.reply_text(f"⏳ 新增 {name}，更新 Xray 設定...")
-        update_xray_clients(clients)
+        await update.message.reply_text(f"[Machine {label}] ⏳ 新增 {name}，更新 Xray 設定...")
+        update_xray_clients(clients, app, machine_id)
 
-        # Generate QR code
-        ip = get_current_ip()
-        uri = make_vless_uri(ip, new_uuid, name)
+        ip = get_current_ip(app)
+        if target == 'b':
+            uri = make_vless_uri_b(ip, new_uuid, name)
+        else:
+            uri = make_vless_uri_c(ip, new_uuid, name)
         qr_buf = generate_qr(uri)
-
         await update.message.reply_photo(qr_buf,
-            caption=f"✅ 已新增用戶：{name}\nUUID：{new_uuid}\n\n掃碼連線")
+            caption=f"[Machine {label}] ✅ 已新增用戶：{name}\nUUID：{new_uuid}\n\n掃碼連線")
 
     elif action == 'remove':
         if name not in clients:
-            await update.message.reply_text(f"❌ 用戶 {name} 不存在")
+            await update.message.reply_text(f"[Machine {label}] ❌ 用戶 {name} 不存在")
             return
 
         clients[name]['active'] = False
         clients_b64 = base64.b64encode(json.dumps(clients).encode()).decode()
-        ssh_run(f"echo '{clients_b64}' | base64 -d > /data/clients.json")
-        update_xray_clients(clients)
-        await update.message.reply_text(f"✅ 已停用用戶：{name}")
+        machine_exec(app, machine_id, f"echo '{clients_b64}' | base64 -d > /data/clients.json")
+        update_xray_clients(clients, app, machine_id)
+        await update.message.reply_text(f"[Machine {label}] ✅ 已停用用戶：{name}")
 
-def update_xray_clients(clients):
-    """Update Xray config with current active clients and restart"""
+def update_xray_clients(clients, app, machine_id):
+    """Update Xray config with current active clients and reload"""
     active = [{'id': v['uuid'], 'flow': 'xtls-rprx-vision', 'email': k}
               for k, v in clients.items() if v.get('active', True)]
 
-    # Read current config
-    config_raw = ssh_run('cat /etc/xray/config.json')
+    config_raw = machine_exec(app, machine_id, 'cat /etc/xray/config.json')
     try:
         config = json.loads(config_raw)
         config['inbounds'][0]['settings']['clients'] = active
         config_b64 = base64.b64encode(json.dumps(config).encode()).decode()
-        ssh_run(f"echo '{config_b64}' | base64 -d > /etc/xray/config.json")
-        ssh_run('kill -HUP $(pgrep xray) 2>/dev/null || true')
+        machine_exec(app, machine_id, f"echo '{config_b64}' | base64 -d > /etc/xray/config.json")
+        machine_exec(app, machine_id, 'kill -HUP $(pgrep xray) 2>/dev/null || true')
     except Exception as e:
         print(f"Error updating Xray config: {e}")
 
 @require_admin
 async def cmd_clients(update, context):
-    clients_raw = ssh_run('cat /data/clients.json 2>/dev/null || echo "{}"')
-    try:
-        clients = json.loads(clients_raw.strip())
-    except:
-        clients = {}
-
-    if not clients:
-        await update.message.reply_text("目前無用戶")
-        return
-
     lines = ["👥 VPN 用戶列表\n"]
-    for name, info in clients.items():
-        status = "✅" if info.get('active', True) else "❌"
-        lines.append(f"{status} {name}")
+
+    for label, app, machine_id in [('B', MACHINE_B_APP, MACHINE_B_ID), ('C', MACHINE_C_APP, MACHINE_C_ID)]:
+        clients_raw = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
+        try:
+            clients = json.loads(clients_raw.strip())
+        except:
+            clients = {}
+
+        lines.append(f"[Machine {label}]")
+        if not clients:
+            lines.append("  目前無用戶")
+        else:
+            for name, info in clients.items():
+                status = "✅" if info.get('active', True) else "❌"
+                lines.append(f"  {status} {name}")
+        lines.append("")
 
     await update.message.reply_text('\n'.join(lines))
 
 @require_admin
 async def cmd_getconfig(update, context):
     args = context.args
-    name = args[0] if args else 'default'
+    target = 'c'
+    name = 'default'
 
-    clients_raw = ssh_run('cat /data/clients.json 2>/dev/null || echo "{}"')
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+    if args:
+        name = args[0]
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
+
+    clients_raw = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
     try:
         clients = json.loads(clients_raw.strip())
     except:
         clients = {}
 
     if name not in clients:
-        await update.message.reply_text(f"❌ 找不到用戶 {name}\n用戶列表：{', '.join(clients.keys())}")
+        await update.message.reply_text(f"[Machine {label}] ❌ 找不到用戶 {name}\n用戶列表：{', '.join(clients.keys())}")
         return
 
-    ip = get_current_ip()
-    uri = make_vless_uri(ip, clients[name]['uuid'], name)
+    ip = get_current_ip(app)
+    if target == 'b':
+        uri = make_vless_uri_b(ip, clients[name]['uuid'], name)
+    else:
+        uri = make_vless_uri_c(ip, clients[name]['uuid'], name)
     qr_buf = generate_qr(uri)
-    await update.message.reply_photo(qr_buf, caption=f"用戶：{name}\nIP：{ip}")
+    await update.message.reply_photo(qr_buf, caption=f"[Machine {label}] 用戶：{name}\nIP：{ip}")
 
 @require_admin
 async def cmd_ping(update, context):
     args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('a', 'b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
     if not args:
-        await update.message.reply_text("用法：/ping 8.8.8.8")
+        await update.message.reply_text("用法：/ping [a|b|c] 8.8.8.8")
         return
+
     host = args[0].replace(';', '').replace('&', '').replace('|', '')
-    result = ssh_run(f'ping -c 4 {host} 2>&1')
+
+    if target == 'a':
+        result = ssh_run(f'ping -c 4 {host} 2>&1', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
+    elif target == 'b':
+        result = machine_exec(MACHINE_B_APP, MACHINE_B_ID, f'ping -c 4 {host} 2>&1')
+    else:
+        result = machine_exec(MACHINE_C_APP, MACHINE_C_ID, f'ping -c 4 {host} 2>&1')
+
     await update.message.reply_text(f"```\n{result[:1000]}\n```", parse_mode='Markdown')
 
 @require_admin
 async def cmd_traceroute(update, context):
     args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('a', 'b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
     if not args:
-        await update.message.reply_text("用法：/traceroute 8.8.8.8")
+        await update.message.reply_text("用法：/traceroute [a|b|c] 8.8.8.8")
         return
+
     host = args[0].replace(';', '').replace('&', '').replace('|', '')
-    result = ssh_run(f'traceroute -m 15 {host} 2>&1')
+
+    if target == 'a':
+        result = ssh_run(f'traceroute -m 15 {host} 2>&1', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
+    elif target == 'b':
+        result = machine_exec(MACHINE_B_APP, MACHINE_B_ID, f'traceroute -m 15 {host} 2>&1')
+    else:
+        result = machine_exec(MACHINE_C_APP, MACHINE_C_ID, f'traceroute -m 15 {host} 2>&1')
+
     await update.message.reply_text(f"```\n{result[:1500]}\n```", parse_mode='Markdown')
 
 @require_admin
 async def cmd_restart(update, context):
-    msg = await update.message.reply_text("⏳ 重啟 Xray...")
-    result = ssh_run("sh -c 'killall -HUP xray && echo OK || (killall xray; sleep 1; echo restarted)')")
-    await msg.edit_text(f"✅ Xray 已重啟\n{result[:200]}")
+    args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
+
+    msg = await update.message.reply_text(f"⏳ Machine {label} 重啟 Xray...")
+    result = machine_exec(app, machine_id, "sh -c 'kill -HUP $(pgrep xray) 2>/dev/null && echo OK || echo restarted'")
+    await msg.edit_text(f"[Machine {label}] ✅ Xray 已重啟\n{result[:200]}")
+
+@require_admin
+async def cmd_iprotation(update, context):
+    args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
+
+    if not args:
+        settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
+        settings = json.loads(settings_raw.strip() or '{}')
+        rotation = settings.get('rotation', 'on')
+        threshold = settings.get('threshold', 90)
+        await update.message.reply_text(f"[Machine {label}] 自動換 IP：{rotation}\n門檻：{threshold}%")
+        return
+
+    param = args[0].lower()
+    if param in ('on', 'off'):
+        machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='{param}'; json.dump(d, open('/data/settings.json','w'))\"")
+        await update.message.reply_text(f"[Machine {label}] ✅ 自動換 IP 已{'開啟' if param=='on' else '關閉'}")
+    elif param.isdigit():
+        val = int(param)
+        if 1 <= val <= 99:
+            machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['threshold']={val}; json.dump(d, open('/data/settings.json','w'))\"")
+            await update.message.reply_text(f"[Machine {label}] ✅ 門檻設為 {val}%")
+        else:
+            await update.message.reply_text("❌ 請輸入 1-99 之間的數字")
+    else:
+        await update.message.reply_text("用法：/iprotation [b|c] on|off|數字")
 
 @require_admin
 async def cmd_adminlist(update, context):
@@ -430,47 +642,54 @@ async def cmd_adminlist(update, context):
 @require_admin
 async def cmd_dlmode(update, context):
     args = context.args
+    target = 'c'
+    if args and args[0].lower() in ('b', 'c'):
+        target = args[0].lower()
+        args = args[1:]
+
+    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
+    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
+    label = target.upper()
+
     if not args:
-        settings_raw = ssh_run('cat /data/settings.json 2>/dev/null || echo "{}"')
+        settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
         settings = json.loads(settings_raw.strip() or '{}')
         mode = "開啟" if settings.get('rotation', 'on') != 'off' else "關閉（下載模式）"
-        await update.message.reply_text(f"自動換 IP：{mode}")
+        await update.message.reply_text(f"[Machine {label}] 自動換 IP：{mode}")
         return
 
     param = args[0].lower()
     if param == 'on':
-        # dlmode on = disable auto rotation
-        ssh_run("python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='off'; json.dump(d, open('/data/settings.json','w'))\"")
-        await update.message.reply_text("✅ 下載模式開啟（自動換 IP 已暫停）")
+        machine_exec(app, machine_id, "python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='off'; json.dump(d, open('/data/settings.json','w'))\"")
+        await update.message.reply_text(f"[Machine {label}] ✅ 下載模式開啟（自動換 IP 已暫停）")
     elif param == 'off':
-        ssh_run("python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='on'; json.dump(d, open('/data/settings.json','w'))\"")
-        await update.message.reply_text("✅ 下載模式關閉（自動換 IP 恢復）")
+        machine_exec(app, machine_id, "python3 -c \"import json; d=json.load(open('/data/settings.json')); d['rotation']='on'; json.dump(d, open('/data/settings.json','w'))\"")
+        await update.message.reply_text(f"[Machine {label}] ✅ 下載模式關閉（自動換 IP 恢復）")
 
 async def post_init(app):
     """Set bot commands menu"""
     commands = [
-        BotCommand("ipswitching", "換 IP（可指定國家，如 /ipswitching us）"),
-        BotCommand("ipnow", "查目前 IP"),
-        BotCommand("iprotation", "自動換 IP 設定（on/off/數字%）"),
-        BotCommand("setlimit", "設定月流量上限（GB）"),
-        BotCommand("usage", "本月流量與費用"),
-        BotCommand("status", "系統狀態"),
-        BotCommand("whoisusing", "目前連線用戶"),
-        BotCommand("vpnallowlist", "管理 VPN 用戶（add/remove 名稱）"),
-        BotCommand("clients", "列出所有 VPN 用戶"),
-        BotCommand("getconfig", "重新取得 QR Code"),
-        BotCommand("ping", "Ping 測試"),
-        BotCommand("traceroute", "路由追蹤"),
-        BotCommand("restart", "重啟 Xray"),
+        BotCommand("status", "全部機器狀態（A WG + B/C Xray）"),
+        BotCommand("ipnow", "查目前 IP (B 和 C)"),
+        BotCommand("usage", "本月流量與費用（B 和 C）"),
+        BotCommand("ipswitching", "換 IP，例：/ipswitching b 或 /ipswitching c"),
+        BotCommand("iprotation", "自動換 IP 設定，例：/iprotation b on"),
+        BotCommand("setlimit", "設定月流量上限，例：/setlimit b 100"),
+        BotCommand("whoisusing", "目前連線用戶，例：/whoisusing b"),
+        BotCommand("vpnallowlist", "管理 VPN 用戶，例：/vpnallowlist b add 名稱"),
+        BotCommand("clients", "列出所有 VPN 用戶（B 和 C）"),
+        BotCommand("getconfig", "重新取得 QR Code，例：/getconfig b default"),
+        BotCommand("ping", "Ping 測試，例：/ping b 8.8.8.8"),
+        BotCommand("traceroute", "路由追蹤，例：/traceroute c 8.8.8.8"),
+        BotCommand("restart", "重啟 Xray，例：/restart b"),
         BotCommand("adminlist", "管理管理員"),
-        BotCommand("dlmode", "下載模式（on=暫停自動換IP，off=恢復）"),
+        BotCommand("dlmode", "下載模式，例：/dlmode b on"),
     ]
     await app.bot.set_my_commands(commands)
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Register handlers
     handlers = [
         ('start', cmd_start),
         ('ipswitching', cmd_ipswitching),
@@ -491,10 +710,10 @@ def main():
     ]
 
     for cmd, handler in handlers:
-        app.add_handler(CommandHandler(cmd, handler, filters=None))
+        application.add_handler(CommandHandler(cmd, handler, filters=None))
 
-    print("ip-opt bot starting...")
-    app.run_polling()
+    print("ip-opt bot starting (multi-machine mode)...")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
