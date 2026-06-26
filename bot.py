@@ -13,13 +13,15 @@ FLY_API_TOKEN = os.environ['FLY_API_TOKEN']
 MACHINE_C_APP = os.environ.get('FLY_APP', 'ganamia-xray-cn')
 MACHINE_C_ID = os.environ.get('MACHINE_C_ID', '080d12db59e978')
 
-# Machine B (Xray WG-VPN app, ganamia-wg-vpn)
-MACHINE_B_APP = os.environ.get('MACHINE_B_APP', 'ganamia-wg-vpn')
-MACHINE_B_ID = os.environ.get('MACHINE_B_ID', '48ee095bd021d8')
+# Machine AB (combined WireGuard + Xray, ganamia-wg-vpn)
+MACHINE_AB_APP = os.environ.get('MACHINE_AB_APP', 'ganamia-wg-vpn')
+MACHINE_AB_ID = os.environ.get('MACHINE_AB_ID', '080d396c039238')
 
-# Machine A (WireGuard, ganamia-wg-vpn)
-MACHINE_A_APP = os.environ.get('MACHINE_A_APP', 'ganamia-wg-vpn')
-MACHINE_A_ID = os.environ.get('MACHINE_A_ID', '2870275c134958')
+# Legacy aliases for backward compatibility
+MACHINE_B_APP = MACHINE_AB_APP
+MACHINE_B_ID = MACHINE_AB_ID
+MACHINE_A_APP = MACHINE_AB_APP
+MACHINE_A_ID = MACHINE_AB_ID
 
 ADMIN_FILE = '/app/data/admins.json'
 SETTINGS_LOCAL = '/app/data/settings.json'
@@ -151,36 +153,36 @@ def make_vless_uri_b(ip, client_uuid, name="VPN-B"):
 @require_admin
 async def cmd_start(update, context):
     await update.message.reply_text(
-        "🔐 ip-opt VPN 管理機器人（3 機器版）\n\n"
-        "A: WireGuard (ganamia-wg-vpn)\n"
-        "B: Xray VLESS (ganamia-wg-vpn, addons.mozilla.org)\n"
+        "🔐 ip-opt VPN 管理機器人（2 機器版）\n\n"
+        "AB: WireGuard + Xray VLESS (ganamia-wg-vpn, addons.mozilla.org)\n"
         "C: Xray VLESS (ganamia-xray-cn, www.apple.com)\n\n"
         "輸入 / 查看所有指令"
     )
 
 @require_admin
 async def cmd_ipnow(update, context):
-    ip_b = get_current_ip(MACHINE_B_APP)
+    ip_ab = get_current_ip(MACHINE_AB_APP)
     ip_c = get_current_ip(MACHINE_C_APP)
     await update.message.reply_text(
         f"🌐 目前 IP\n"
-        f"Machine B (Xray WG): {ip_b or '無法取得'}\n"
+        f"Machine AB (WG+Xray): {ip_ab or '無法取得'}\n"
         f"Machine C (Xray CN): {ip_c or '無法取得'}"
     )
 
 @require_admin
 async def cmd_ipswitching(update, context):
     args = context.args
-    # Support /ipswitching [b|c] [country]
+    # Support /ipswitching [ab|b|c] [country]
     target = 'c'
-    if args and args[0].lower() in ('b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
-    if target == 'b':
-        app = MACHINE_B_APP
-        machine_id = MACHINE_B_ID
-        label = 'B'
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+        target = 'b'  # use b uri maker for AB
     else:
         app = MACHINE_C_APP
         machine_id = MACHINE_C_ID
@@ -229,13 +231,18 @@ async def cmd_ipswitching(update, context):
 async def cmd_iprotation(update, context):
     args = context.args
     target = 'c'
-    if args and args[0].lower() in ('b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
 
     if not args:
         settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
@@ -263,17 +270,22 @@ async def cmd_iprotation(update, context):
 async def cmd_setlimit(update, context):
     args = context.args
     target = 'c'
-    if args and args[0].lower() in ('b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
     if not args or not args[0].isdigit():
-        await update.message.reply_text("用法：/setlimit [b|c] 100 (GB)")
+        await update.message.reply_text("用法：/setlimit [ab|c] 100 (GB)")
         return
 
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
     gb = int(args[0])
     machine_exec(app, machine_id, f"python3 -c \"import json; d=json.load(open('/data/settings.json')); d['limit_gb']={gb}; json.dump(d, open('/data/settings.json','w'))\"")
     await update.message.reply_text(f"[Machine {label}] ✅ 月流量上限設為 {gb} GB")
@@ -284,7 +296,7 @@ async def cmd_usage(update, context):
     month = datetime.datetime.utcnow().strftime('%Y-%m')
     lines = ["📊 流量統計\n"]
 
-    for label, app, machine_id in [('B', MACHINE_B_APP, MACHINE_B_ID), ('C', MACHINE_C_APP, MACHINE_C_ID)]:
+    for label, app, machine_id in [('AB', MACHINE_AB_APP, MACHINE_AB_ID), ('C', MACHINE_C_APP, MACHINE_C_ID)]:
         data_raw = machine_exec(app, machine_id, 'cat /data/traffic.json 2>/dev/null || echo "{}"')
         settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
         try:
@@ -314,38 +326,55 @@ async def cmd_usage(update, context):
 async def cmd_status(update, context):
     lines = ["🖥 系統狀態\n"]
 
-    # Machine A - WireGuard via SSH
-    try:
-        wg_out = ssh_run('wg show 2>/dev/null || echo "WireGuard N/A"', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
-        # Count peers
-        peer_count = wg_out.count('peer:')
-        # Get latest handshake lines
-        handshake_lines = [l.strip() for l in wg_out.splitlines() if 'latest handshake' in l.lower()]
-        lines.append(f"[Machine A] WireGuard")
-        if 'N/A' in wg_out or not wg_out.strip():
-            lines.append("  狀態：無法取得")
-        else:
-            lines.append(f"  Peers：{peer_count}")
-            for h in handshake_lines[:3]:
-                lines.append(f"  {h}")
-    except Exception as e:
-        lines.append(f"[Machine A] WireGuard: 錯誤 {e}")
-    lines.append("")
+    # Machine AB - WireGuard + Xray (combined)
+    ip_ab = get_current_ip(MACHINE_AB_APP)
+    ps_ab = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'ps aux')
+    xray_ab = 'xray' in ps_ab
+    wg_ab = 'node /app/server.js' in ps_ab
+    uptime_ab = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'uptime').strip()
 
-    # Machine B - Xray
-    ip_b = get_current_ip(MACHINE_B_APP)
-    ps_b = machine_exec(MACHINE_B_APP, MACHINE_B_ID, 'ps | grep xray | grep -v grep || echo ""')
-    xray_b = 'xray' in ps_b
-    uptime_b = machine_exec(MACHINE_B_APP, MACHINE_B_ID, 'uptime').strip()
-    lines.append(f"[Machine B] Xray (addons.mozilla.org)")
-    lines.append(f"  Xray：{'✅ 運行中' if xray_b else '❌ 已停止'}")
-    lines.append(f"  IP：{ip_b or '無'}")
-    lines.append(f"  {uptime_b}")
+    # WireGuard peers via wg show
+    try:
+        wg_out = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'wg show all dump')
+        peer_count = len([l for l in wg_out.splitlines() if len(l.split('\t')) >= 9])
+        handshake_lines = []
+        wg_json_raw = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'cat /etc/wireguard/wg0.json 2>/dev/null || echo "{}"')
+        try:
+            wg_json = json.loads(wg_json_raw.strip())
+            clients = wg_json.get('clients', {})
+            names = {v.get('publicKey'): v.get('name', k) for k, v in clients.items()}
+        except:
+            names = {}
+        for line in wg_out.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 9:
+                pubkey = parts[1]
+                hs = int(parts[5]) if parts[5].isdigit() else 0
+                name = names.get(pubkey, pubkey[:12] + '...')
+                if hs > 0:
+                    import time
+                    age = int(time.time()) - hs
+                    status = '✅' if age < 180 else '⏸'
+                    handshake_lines.append(f"  {status} {name} ({age}s ago)")
+                else:
+                    handshake_lines.append(f"  ⭕ {name} (未連線)")
+    except Exception as e:
+        peer_count = 0
+        handshake_lines = [f"  WG 錯誤: {e}"]
+
+    lines.append(f"[Machine AB] WireGuard + Xray (ganamia-wg-vpn)")
+    lines.append(f"  IP：{ip_ab or '無'}")
+    lines.append(f"  wg-easy：{'✅ 運行中' if wg_ab else '❌ 已停止'}")
+    lines.append(f"  Xray：{'✅ 運行中' if xray_ab else '❌ 已停止'}")
+    lines.append(f"  WG Peers：{peer_count}")
+    for h in handshake_lines[:5]:
+        lines.append(h)
+    lines.append(f"  {uptime_ab}")
     lines.append("")
 
     # Machine C - Xray
     ip_c = get_current_ip(MACHINE_C_APP)
-    ps_c = machine_exec(MACHINE_C_APP, MACHINE_C_ID, 'ps | grep xray | grep -v grep || echo ""')
+    ps_c = machine_exec(MACHINE_C_APP, MACHINE_C_ID, 'ps aux')
     xray_c = 'xray' in ps_c
     uptime_c = machine_exec(MACHINE_C_APP, MACHINE_C_ID, 'uptime').strip()
     lines.append(f"[Machine C] Xray (www.apple.com)")
@@ -359,16 +388,33 @@ async def cmd_status(update, context):
 async def cmd_whoisusing(update, context):
     args = context.args
     target = 'both'
-    if args and args[0].lower() in ('a', 'b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
 
     lines = []
 
-    if target in ('b', 'both'):
-        log_b = machine_exec(MACHINE_B_APP, MACHINE_B_ID, 'tail -10 /var/log/xray/access.log 2>/dev/null || echo "暫無記錄"')
-        lines.append("[Machine B] 最近連線：")
-        connections = [l for l in log_b.split('\n') if 'accepted' in l.lower() or '>>>' in l]
+    if target in ('ab', 'b', 'both'):
+        log_ab = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'tail -10 /var/log/xray/access.log 2>/dev/null || echo "暫無記錄"')
+        lines.append("[Machine AB] Xray 最近連線：")
+        connections = [l for l in log_ab.split('\n') if 'accepted' in l.lower() or '>>>' in l]
         lines.append('\n'.join(connections[-5:]) if connections else "  無記錄")
+        lines.append("")
+
+        # Also show WireGuard status
+        wg_dump = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'wg show all dump')
+        lines.append("[Machine AB] WireGuard peers：")
+        wg_json_raw = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, 'cat /etc/wireguard/wg0.json 2>/dev/null || echo "{}"')
+        try:
+            wg_json = json.loads(wg_json_raw.strip())
+            names = {v.get('publicKey'): v.get('name', k) for k, v in wg_json.get('clients', {}).items()}
+        except:
+            names = {}
+        for line in wg_dump.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 9:
+                pubkey = parts[1]
+                name = names.get(pubkey, pubkey[:16])
+                lines.append(f"  {name}: endpoint={parts[3]}")
         lines.append("")
 
     if target in ('c', 'both'):
@@ -376,11 +422,6 @@ async def cmd_whoisusing(update, context):
         lines.append("[Machine C] 最近連線：")
         connections = [l for l in log_c.split('\n') if 'accepted' in l.lower() or '>>>' in l]
         lines.append('\n'.join(connections[-5:]) if connections else "  無記錄")
-
-    if target == 'a':
-        wg = ssh_run('wg show', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
-        lines.append("[Machine A] WireGuard peers：")
-        lines.append(wg[:500] if wg.strip() else "  無記錄")
 
     await update.message.reply_text('\n'.join(lines) or "暫無連線記錄")
 
@@ -392,17 +433,22 @@ async def cmd_vpnallowlist(update, context):
         return
 
     target = 'c'
-    if args[0].lower() in ('b', 'c'):
+    if args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
     if len(args) < 2:
-        await update.message.reply_text("用法：/vpnallowlist [b|c] add 名稱 | /vpnallowlist [b|c] remove 名稱")
+        await update.message.reply_text("用法：/vpnallowlist [ab|c] add 名稱 | /vpnallowlist [ab|c] remove 名稱")
         return
 
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
     action = args[0].lower()
     name = args[1]
 
@@ -465,7 +511,7 @@ def update_xray_clients(clients, app, machine_id):
 async def cmd_clients(update, context):
     lines = ["👥 VPN 用戶列表\n"]
 
-    for label, app, machine_id in [('B', MACHINE_B_APP, MACHINE_B_ID), ('C', MACHINE_C_APP, MACHINE_C_ID)]:
+    for label, app, machine_id in [('AB', MACHINE_AB_APP, MACHINE_AB_ID), ('C', MACHINE_C_APP, MACHINE_C_ID)]:
         clients_raw = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
         try:
             clients = json.loads(clients_raw.strip())
@@ -489,15 +535,21 @@ async def cmd_getconfig(update, context):
     target = 'c'
     name = 'default'
 
-    if args and args[0].lower() in ('b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
     if args:
         name = args[0]
 
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+        target = 'b'  # use b uri maker
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
 
     clients_raw = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
     try:
@@ -521,20 +573,18 @@ async def cmd_getconfig(update, context):
 async def cmd_ping(update, context):
     args = context.args
     target = 'c'
-    if args and args[0].lower() in ('a', 'b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
     if not args:
-        await update.message.reply_text("用法：/ping [a|b|c] 8.8.8.8")
+        await update.message.reply_text("用法：/ping [ab|c] 8.8.8.8")
         return
 
     host = args[0].replace(';', '').replace('&', '').replace('|', '')
 
-    if target == 'a':
-        result = ssh_run(f'ping -c 4 {host} 2>&1', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
-    elif target == 'b':
-        result = machine_exec(MACHINE_B_APP, MACHINE_B_ID, f'ping -c 4 {host} 2>&1')
+    if target in ('ab', 'b'):
+        result = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, f'ping -c 4 {host} 2>&1')
     else:
         result = machine_exec(MACHINE_C_APP, MACHINE_C_ID, f'ping -c 4 {host} 2>&1')
 
@@ -544,20 +594,18 @@ async def cmd_ping(update, context):
 async def cmd_traceroute(update, context):
     args = context.args
     target = 'c'
-    if args and args[0].lower() in ('a', 'b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
     if not args:
-        await update.message.reply_text("用法：/traceroute [a|b|c] 8.8.8.8")
+        await update.message.reply_text("用法：/traceroute [ab|c] 8.8.8.8")
         return
 
     host = args[0].replace(';', '').replace('&', '').replace('|', '')
 
-    if target == 'a':
-        result = ssh_run(f'traceroute -m 15 {host} 2>&1', app=MACHINE_A_APP, machine_id=MACHINE_A_ID)
-    elif target == 'b':
-        result = machine_exec(MACHINE_B_APP, MACHINE_B_ID, f'traceroute -m 15 {host} 2>&1')
+    if target in ('ab', 'b'):
+        result = machine_exec(MACHINE_AB_APP, MACHINE_AB_ID, f'traceroute -m 15 {host} 2>&1')
     else:
         result = machine_exec(MACHINE_C_APP, MACHINE_C_ID, f'traceroute -m 15 {host} 2>&1')
 
@@ -567,12 +615,17 @@ async def cmd_traceroute(update, context):
 async def cmd_restart(update, context):
     args = context.args
     target = 'c'
-    if args and args[0].lower() in ('b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
 
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
 
     msg = await update.message.reply_text(f"⏳ Machine {label} 重啟 Xray...")
     result = machine_exec(app, machine_id, "sh -c 'kill -HUP $(pgrep xray) 2>/dev/null && echo OK || echo restarted'")
@@ -609,13 +662,18 @@ async def cmd_adminlist(update, context):
 async def cmd_dlmode(update, context):
     args = context.args
     target = 'c'
-    if args and args[0].lower() in ('b', 'c'):
+    if args and args[0].lower() in ('ab', 'b', 'c'):
         target = args[0].lower()
         args = args[1:]
 
-    app = MACHINE_B_APP if target == 'b' else MACHINE_C_APP
-    machine_id = MACHINE_B_ID if target == 'b' else MACHINE_C_ID
-    label = target.upper()
+    if target in ('ab', 'b'):
+        app = MACHINE_AB_APP
+        machine_id = MACHINE_AB_ID
+        label = 'AB'
+    else:
+        app = MACHINE_C_APP
+        machine_id = MACHINE_C_ID
+        label = 'C'
 
     if not args:
         settings_raw = machine_exec(app, machine_id, 'cat /data/settings.json 2>/dev/null || echo "{}"')
@@ -635,21 +693,21 @@ async def cmd_dlmode(update, context):
 async def post_init(app):
     """Set bot commands menu"""
     commands = [
-        BotCommand("status", "全部機器狀態（A WG + B/C Xray）"),
-        BotCommand("ipnow", "查目前 IP (B 和 C)"),
-        BotCommand("usage", "本月流量與費用（B 和 C）"),
-        BotCommand("ipswitching", "換 IP，例：/ipswitching b 或 /ipswitching c"),
-        BotCommand("iprotation", "自動換 IP 設定，例：/iprotation b on"),
-        BotCommand("setlimit", "設定月流量上限，例：/setlimit b 100"),
-        BotCommand("whoisusing", "目前連線用戶，例：/whoisusing b"),
-        BotCommand("vpnallowlist", "管理 VPN 用戶，例：/vpnallowlist b add 名稱"),
-        BotCommand("clients", "列出所有 VPN 用戶（B 和 C）"),
-        BotCommand("getconfig", "重新取得 QR Code，例：/getconfig b default"),
-        BotCommand("ping", "Ping 測試，例：/ping b 8.8.8.8"),
+        BotCommand("status", "全部機器狀態（AB WG+Xray + C Xray）"),
+        BotCommand("ipnow", "查目前 IP (AB 和 C)"),
+        BotCommand("usage", "本月流量與費用（AB 和 C）"),
+        BotCommand("ipswitching", "換 IP，例：/ipswitching ab 或 /ipswitching c"),
+        BotCommand("iprotation", "自動換 IP 設定，例：/iprotation ab on"),
+        BotCommand("setlimit", "設定月流量上限，例：/setlimit ab 100"),
+        BotCommand("whoisusing", "目前連線用戶，例：/whoisusing ab"),
+        BotCommand("vpnallowlist", "管理 VPN 用戶，例：/vpnallowlist ab add 名稱"),
+        BotCommand("clients", "列出所有 VPN 用戶（AB 和 C）"),
+        BotCommand("getconfig", "重新取得 QR Code，例：/getconfig ab default"),
+        BotCommand("ping", "Ping 測試，例：/ping ab 8.8.8.8"),
         BotCommand("traceroute", "路由追蹤，例：/traceroute c 8.8.8.8"),
-        BotCommand("restart", "重啟 Xray，例：/restart b"),
+        BotCommand("restart", "重啟 Xray，例：/restart ab"),
         BotCommand("adminlist", "管理管理員"),
-        BotCommand("dlmode", "下載模式，例：/dlmode b on"),
+        BotCommand("dlmode", "下載模式，例：/dlmode ab on"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -678,7 +736,7 @@ def main():
     for cmd, handler in handlers:
         application.add_handler(CommandHandler(cmd, handler, filters=None))
 
-    print("ip-opt bot starting (multi-machine mode)...")
+    print("ip-opt bot starting (AB+C combined mode, Machine AB=080d396c039238)...")
     application.run_polling()
 
 if __name__ == '__main__':
