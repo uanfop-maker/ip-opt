@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ip-opt: Fly.io Xray VPN management Telegram bot (multi-machine)"""
-import os, json, uuid, base64, subprocess, requests, tempfile, qrcode
+import os, json, uuid, base64, subprocess, requests, tempfile, qrcode, socket, time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -93,6 +94,63 @@ def get_current_ip(app=None):
         pass
     return None
 
+def get_current_ipinfo(app=None):
+    """Return (v4_address, region) for an app, or (None, None)."""
+    target_app = app or MACHINE_C_APP
+    result = fly_api('{ app(name: "' + target_app + '") { ipAddresses { nodes { address type region } } } }')
+    try:
+        for ip in result['data']['app']['ipAddresses']['nodes']:
+            if ip['type'] == 'v4':
+                return ip['address'], ip.get('region') or 'global'
+    except:
+        pass
+    return None, None
+
+def allocate_ip(app, region='global', retries=3):
+    """Allocate a new dedicated v4. Returns (address, error). Retries on transient failure."""
+    last = None
+    for attempt in range(retries):
+        result = fly_api('''
+        mutation($input: AllocateIPAddressInput!) {
+            allocateIpAddress(input: $input) { ipAddress { address } }
+        }''', {'input': {'appId': app, 'type': 'v4', 'region': region or 'global'}})
+        try:
+            return result['data']['allocateIpAddress']['ipAddress']['address'], None
+        except Exception:
+            last = result
+            time.sleep(1.5 * (attempt + 1))
+    return None, last
+
+def release_ip(app, ip):
+    return fly_api('''
+    mutation($input: ReleaseIPAddressInput!) {
+        releaseIpAddress(input: $input) { app { name } }
+    }''', {'input': {'appId': app, 'ip': ip}})
+
+def verify_ip(ip, port=443, retries=6, delay=2, timeout=6):
+    """TCP-connect check that a new IP routes to the machine. Returns (ok, latency_ms_or_err)."""
+    last = None
+    for _ in range(retries):
+        t0 = time.time()
+        try:
+            s = socket.create_connection((ip, port), timeout=timeout)
+            s.close()
+            return True, round((time.time() - t0) * 1000, 1)
+        except Exception as e:
+            last = str(e)
+            time.sleep(delay)
+    return False, last
+
+def geo_lookup(ip):
+    """Best-effort region/geo for an IP (no proxy needed). Returns short string or ''."""
+    try:
+        r = requests.get(f'https://ipinfo.io/{ip}/json', timeout=8)
+        d = r.json()
+        parts = [d.get('city'), d.get('country'), d.get('org')]
+        return ' / '.join(p for p in parts if p)
+    except:
+        return ''
+
 def ssh_run(cmd, app=None, machine_id=None):
     """Run command on a specific Fly.io machine via SSH"""
     fly_path = '/root/.fly/bin/flyctl'
@@ -182,43 +240,79 @@ async def cmd_ipswitching(update, context):
         app = MACHINE_AB_APP
         machine_id = MACHINE_AB_ID
         label = 'AB'
+        port = XRAY_B_PORT
         target = 'b'  # use b uri maker for AB
     else:
         app = MACHINE_C_APP
         machine_id = MACHINE_C_ID
         label = 'C'
+        port = XRAY_C_PORT
 
     msg = await update.message.reply_text(f"🔄 Machine {label} 換 IP...")
-    old_ip = get_current_ip(app)
 
-    result = fly_api('''
-    mutation($input: AllocateIPAddressInput!) {
-        allocateIpAddress(input: $input) { ipAddress { address } }
-    }''', {'input': {'appId': app, 'type': 'v4', 'region': ''}})
+    # Run the blocking allocate/verify/release flow off the event loop.
+    import asyncio
+    loop = asyncio.get_event_loop()
 
-    new_ip = None
-    try:
-        new_ip = result['data']['allocateIpAddress']['ipAddress']['address']
-    except:
-        await msg.edit_text(f"❌ Machine {label} 換 IP 失敗：{result}")
+    def do_switch():
+        # 1. Read current IP+region and pre-fetch clients in parallel (saves a round-trip).
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_ip = ex.submit(get_current_ipinfo, app)
+            f_clients = ex.submit(machine_exec, app, machine_id,
+                                  'cat /data/clients.json 2>/dev/null || echo "{}"')
+            old_ip, region = f_ip.result()
+            clients_json = f_clients.result()
+
+        # 2. Allocate a new dedicated v4 (with retry), preserving the original region.
+        new_ip, err = allocate_ip(app, region or 'global')
+        if not new_ip:
+            return {'ok': False, 'err': err}
+
+        # 3. Verify the new IP actually routes to the machine BEFORE releasing the old one
+        #    (zero-downtime: both IPs are live during this window).
+        ok, lat = verify_ip(new_ip, port)
+
+        # 4. Only release the old IP once the new one is confirmed reachable.
+        released = False
+        if ok and old_ip and old_ip != new_ip:
+            release_ip(app, old_ip)
+            released = True
+
+        try:
+            clients = json.loads(clients_json.strip())
+        except:
+            clients = {}
+
+        geo = geo_lookup(new_ip)
+        return {'ok': True, 'old_ip': old_ip, 'new_ip': new_ip, 'region': region,
+                'reachable': ok, 'latency': lat, 'released': released,
+                'geo': geo, 'clients': clients}
+
+    res = await loop.run_in_executor(None, do_switch)
+
+    if not res['ok']:
+        await msg.edit_text(f"❌ Machine {label} 換 IP 失敗：{res['err']}")
         return
 
-    if old_ip and old_ip != new_ip:
-        fly_api('''
-        mutation($input: ReleaseIPAddressInput!) {
-            releaseIpAddress(input: $input) { app { name } }
-        }''', {'input': {'appId': app, 'ip': old_ip}})
+    if res['reachable']:
+        status = f"✅ 新 IP 已生效（{res['latency']} ms）"
+    else:
+        status = ("⚠️ 新 IP 已分配，但暫時無法連線，舊 IP 已保留以避免斷線；"
+                  f"請稍後用 /ipnow 確認。（{res['latency']}）")
 
-    clients_json = machine_exec(app, machine_id, 'cat /data/clients.json 2>/dev/null || echo "{}"')
-    try:
-        clients = json.loads(clients_json.strip())
-    except:
-        clients = {}
-
-    text = f"✅ Machine {label} IP 已切換\n舊 IP：{old_ip}\n新 IP：{new_ip}\n\n掃碼更新設定："
+    text = (f"{status}\n"
+            f"Machine {label}\n"
+            f"舊 IP：{res['old_ip']}\n"
+            f"新 IP：{res['new_ip']}（{res['region'] or 'global'}）")
+    if res['geo']:
+        text += f"\n地區：{res['geo']}"
+    if not res['released']:
+        text += "\n（舊 IP 未釋放）"
+    text += "\n\n掃碼更新設定："
     await msg.edit_text(text)
 
-    for name, info in clients.items():
+    new_ip = res['new_ip']
+    for name, info in res['clients'].items():
         if info.get('active', True):
             if target == 'b':
                 uri = make_vless_uri_b(new_ip, info['uuid'], name)
